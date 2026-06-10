@@ -32,25 +32,27 @@ remediation = RemediationAgent()
 class IncidentRequest(BaseModel):
     logs: list[str]
 
+
 @app.post("/diagnose")
 async def diagnose_incident(
     request: IncidentRequest, 
     current_user: User = Depends(get_current_user), 
     db: Session = Depends(get_db)
 ):
-    """Diagnose incident and save to user's history (Requires Auth)"""
-    # 1. Monitor
+    """Diagnose incident and save to user's history"""
     anomaly = monitor.detect_anomaly(request.logs)
     if not anomaly.get("anomaly_detected"):
         return {"status": "ok", "anomaly_detected": False}
         
-    # 2. Diagnose & Remediate (Using the template/hybrid logic you set up)
     root_cause = diagnosis.analyze_root_cause(anomaly, request.logs)
     remed_plan = remediation.suggest_remediation(anomaly, root_cause)
     
-    # 3. Save to database securely tied to the user
+    # SAVE THE RAW LOGS
+    log_text = "\n".join(request.logs)
+    
     new_incident = Incident(
         user_id=current_user.id,
+        raw_logs=log_text,
         status="open",
         anomaly_description=anomaly.get("description", "Unknown anomaly"),
         root_cause=root_cause.get("root_cause", "Pending analysis"),
@@ -73,12 +75,19 @@ async def get_user_incidents(
     current_user: User = Depends(get_current_user), 
     db: Session = Depends(get_db)
 ):
-    """Protected route: Get ONLY this specific user's incident history"""
-    incidents = db.query(Incident).filter(
-        Incident.user_id == current_user.id
-    ).order_by(Incident.timestamp.desc()).all()
+    """Get all incidents for current user"""
+    incidents = db.query(Incident).filter(Incident.user_id == current_user.id).order_by(Incident.timestamp.desc()).all()
     
-    return [{"id": i.id, "timestamp": i.timestamp, "anomaly_description": i.anomaly_description, "status": i.status} for i in incidents]
+    # RETURN RAW LOGS TO FRONTEND
+    return [{
+        "id": i.id, 
+        "timestamp": i.timestamp, 
+        "raw_logs": i.raw_logs, 
+        "anomaly": i.anomaly_description, 
+        "root_cause": i.root_cause,
+        "remediation": i.remediation_action,
+        "status": i.status
+    } for i in incidents]
 
 @app.get("/health")
 def health():
