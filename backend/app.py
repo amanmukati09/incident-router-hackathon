@@ -1,14 +1,17 @@
-from fastapi import FastAPI, Depends, Header
+from fastapi import FastAPI, Depends, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
+from typing import Optional
 import json
 
-from models import User, Incident, get_db
+# Added ChatSession and ChatMessage imports here!
+from models import User, Incident, ChatSession, ChatMessage, get_db
 from auth import router as auth_router, get_current_user
 from agents.monitor import MonitorAgent
 from agents.diagnosis import DiagnosisAgent
 from agents.remediation import RemediationAgent
+from agents.chat import ChatAgent
 
 app = FastAPI(title="AegisAI Backend")
 
@@ -28,9 +31,14 @@ app.include_router(auth_router)
 monitor = MonitorAgent()
 diagnosis = DiagnosisAgent()
 remediation = RemediationAgent()
+chat_agent = ChatAgent()
 
 class IncidentRequest(BaseModel):
     logs: list[str]
+
+class ChatRequest(BaseModel):
+    session_id: Optional[int] = None
+    message: str
 
 @app.post("/diagnose")
 async def diagnose_incident(
@@ -88,6 +96,86 @@ async def get_user_incidents(
         "remediation": i.remediation_action,
         "status": i.status
     } for i in incidents]
+
+# --- NEW CHAT ENDPOINTS ---
+
+@app.post("/chat/message")
+async def send_chat_message(
+    req: ChatRequest, 
+    current_user: User = Depends(get_current_user), 
+    db: Session = Depends(get_db)
+):
+    session_id = req.session_id
+    
+    # 1. Create a new session if one doesn't exist
+    if not session_id:
+        title = req.message[:30] + "..." if len(req.message) > 30 else req.message
+        new_session = ChatSession(user_id=current_user.id, title=title)
+        db.add(new_session)
+        db.commit()
+        db.refresh(new_session)
+        session_id = new_session.id
+
+    # 2. Save User Message
+    user_msg = ChatMessage(session_id=session_id, role="user", content=req.message)
+    db.add(user_msg)
+    
+    # 3. Get AI Response
+    ai_response = chat_agent.generate_response(req.message, [])
+    
+    # 4. Save AI Message
+    ai_msg = ChatMessage(session_id=session_id, role="ai", content=ai_response)
+    db.add(ai_msg)
+    db.commit()
+
+    # 5. Fetch full history for Gradio format [[user, ai], [user, ai]]
+    msgs = db.query(ChatMessage).filter(ChatMessage.session_id == session_id).order_by(ChatMessage.timestamp.asc()).all()
+    
+    chat_format = []
+    temp_user = ""
+    for m in msgs:
+        if m.role == "user":
+            temp_user = m.content
+        else:
+            chat_format.append([temp_user, m.content])
+            temp_user = ""
+            
+    if temp_user: # Handle dangling user message just in case
+        chat_format.append([temp_user, ""])
+
+    return {"session_id": session_id, "history": chat_format}
+
+@app.get("/chat/sessions")
+async def get_chat_sessions(
+    current_user: User = Depends(get_current_user), 
+    db: Session = Depends(get_db)
+):
+    """Get all past chat sessions for the sidebar"""
+    sessions = db.query(ChatSession).filter(ChatSession.user_id == current_user.id).order_by(ChatSession.created_at.desc()).all()
+    # Return as {id: title} dict for Gradio Dropdown
+    return {str(s.id): f"ID: {s.id} | {s.title}" for s in sessions}
+
+@app.get("/chat/sessions/{session_id}")
+async def get_chat_history(
+    session_id: int,
+    current_user: User = Depends(get_current_user), 
+    db: Session = Depends(get_db)
+):
+    """Load a specific chat history"""
+    session = db.query(ChatSession).filter(ChatSession.id == session_id, ChatSession.user_id == current_user.id).first()
+    if not session:
+        return []
+        
+    msgs = db.query(ChatMessage).filter(ChatMessage.session_id == session_id).order_by(ChatMessage.timestamp.asc()).all()
+    chat_format = []
+    temp_user = ""
+    for m in msgs:
+        if m.role == "user":
+            temp_user = m.content
+        else:
+            chat_format.append([temp_user, m.content])
+            temp_user = ""
+    return chat_format
 
 @app.get("/health")
 def health():

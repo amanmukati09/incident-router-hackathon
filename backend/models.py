@@ -1,9 +1,8 @@
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, ForeignKey
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, ForeignKey, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from datetime import datetime
 import hashlib
-import os
 
 DATABASE_URL = "sqlite:///./app.db"
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
@@ -20,22 +19,43 @@ class User(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     
     incidents = relationship("Incident", back_populates="owner")
+    chat_sessions = relationship("ChatSession", back_populates="owner")
 
 class Incident(Base):
     __tablename__ = "incidents"
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"))
-    raw_logs = Column(String) 
+    raw_logs = Column(Text) 
     timestamp = Column(DateTime, default=datetime.utcnow)
     status = Column(String, default="open")
-    anomaly_description = Column(String)
-    root_cause = Column(String)
-    remediation_action = Column(String)
+    anomaly_description = Column(Text)
+    root_cause = Column(Text)
+    remediation_action = Column(Text)
     remediation_status = Column(String, default="pending")
     
     owner = relationship("User", back_populates="incidents")
 
-# Create tables
+# --- NEW CHAT MODELS ---
+class ChatSession(Base):
+    __tablename__ = "chat_sessions"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    title = Column(String, default="New Incident Discussion")
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    owner = relationship("User", back_populates="chat_sessions")
+    messages = relationship("ChatMessage", back_populates="session", cascade="all, delete-orphan")
+
+class ChatMessage(Base):
+    __tablename__ = "chat_messages"
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(Integer, ForeignKey("chat_sessions.id"))
+    role = Column(String) # "user" or "ai"
+    content = Column(Text)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+    
+    session = relationship("ChatSession", back_populates="messages")
+
 Base.metadata.create_all(bind=engine)
 
 def get_db():
