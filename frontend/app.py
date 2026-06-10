@@ -1,186 +1,173 @@
 import gradio as gr
 import requests
-import json
-import sqlite3
 import pandas as pd
 
 BACKEND_URL = "http://localhost:8000"
 
-def get_stats():
-    try:
-        conn = sqlite3.connect("data/incidents.db")
-        c = conn.cursor()
-        total = c.execute("SELECT COUNT(*) FROM incidents").fetchone()[0]
-        resolved = c.execute("SELECT COUNT(*) FROM incidents WHERE status='resolved'").fetchone()[0]
-        critical = c.execute("SELECT COUNT(*) FROM incidents WHERE anomaly_description LIKE '%CRITICAL%'").fetchone()[0]
-        conn.close()
-        return total, resolved, critical
-    except:
-        return 0, 0, 0
+# --- API Callers ---
 
-def get_incident_history():
+def api_login(email, password):
     try:
-        conn = sqlite3.connect("data/incidents.db")
-        c = conn.cursor()
-        incidents = c.execute("""
-            SELECT id, timestamp, status, anomaly_description 
-            FROM incidents 
-            ORDER BY id DESC 
-            LIMIT 15
-        """).fetchall()
-        conn.close()
-        
-        data = []
-        for inc in incidents:
-            try:
-                anomaly = json.loads(inc[3])
-                data.append({
-                    "ID": inc[0],
-                    "Time": inc[1][:19] if inc[1] else "N/A",
-                    "Status": inc[2],
-                    "Type": anomaly.get("anomaly_type", "N/A"),
-                    "Severity": anomaly.get("severity", "N/A"),
-                    "Component": anomaly.get("affected_component", "N/A")
-                })
-            except:
-                pass
-        
-        return pd.DataFrame(data) if data else pd.DataFrame()
-    except:
-        return pd.DataFrame()
+        res = requests.post(f"{BACKEND_URL}/auth/login", json={"email": email, "password": password})
+        if res.status_code == 200:
+            token = res.json().get("access_token")
+            return token, gr.update(visible=False), gr.update(visible=True), "✅ Login Successful!"
+        return "", gr.update(visible=True), gr.update(visible=False), f"❌ Login Failed: {res.json().get('detail')}"
+    except Exception as e:
+        return "", gr.update(visible=True), gr.update(visible=False), f"❌ Connection Error: {str(e)}"
 
-def diagnose_logs(logs_text):
+def api_register(email, password, name):
+    try:
+        res = requests.post(f"{BACKEND_URL}/auth/register", json={"email": email, "password": password, "full_name": name})
+        if res.status_code == 200:
+            token = res.json().get("access_token")
+            return token, gr.update(visible=False), gr.update(visible=True), "✅ Registration Successful!"
+        return "", gr.update(visible=True), gr.update(visible=False), f"❌ Registration Failed: {res.json().get('detail')}"
+    except Exception as e:
+        return "", gr.update(visible=True), gr.update(visible=False), f"❌ Connection Error: {str(e)}"
+
+def fetch_history(token):
+    if not token:
+        return pd.DataFrame(columns=["ID", "Timestamp", "Description", "Status"])
+    try:
+        res = requests.get(f"{BACKEND_URL}/my-incidents", headers={"Authorization": f"Bearer {token}"})
+        if res.status_code == 200:
+            data = res.json()
+            if not data:
+                return pd.DataFrame(columns=["ID", "Timestamp", "Description", "Status"])
+            return pd.DataFrame(data)[["id", "timestamp", "anomaly_description", "status"]]
+        return pd.DataFrame(columns=["ID", "Timestamp", "Description", "Status"])
+    except:
+        return pd.DataFrame(columns=["ID", "Timestamp", "Description", "Status"])
+
+def diagnose_logs(logs_text, token):
+    if not token:
+        return "❌ Please log in first.", gr.update()
     if not logs_text.strip():
-        return "", "", "", gr.update(value=get_incident_history())
-    
-    logs = [line.strip() for line in logs_text.split("\n") if line.strip()]
+        return "⚠️ Please enter some logs.", gr.update()
     
     try:
-        response = requests.post(
-            f"{BACKEND_URL}/diagnose",
-            json={"logs": logs},
-            timeout=300
+        # Split logs by newline into a list
+        log_lines = [line.strip() for line in logs_text.split('\n') if line.strip()]
+        
+        res = requests.post(
+            f"{BACKEND_URL}/diagnose", 
+            json={"logs": log_lines},
+            headers={"Authorization": f"Bearer {token}"}
         )
         
-        if response.status_code != 200:
-            return f'<div style="color: red; padding: 20px; background: #f8d7da; border-radius: 4px;">❌ Backend error: {response.status_code}</div>', "", "", gr.update(value=get_incident_history())
-        
-        result = response.json()
-        print(f"DEBUG: Response = {result}")  # Debug print
-        
-        # Check if anomaly detected
-        anomaly = result.get("anomaly", {})
-        anomaly_detected = anomaly.get("anomaly_detected", False)
-        
-        print(f"DEBUG: anomaly_detected = {anomaly_detected}")  # Debug
-        
-        if not anomaly_detected:
-            return (
-                '<div style="padding: 20px; background: #d4edda; border-left: 4px solid #28a745; border-radius: 4px;"><h3 style="color: #155724;">✅ System Healthy</h3><p>No anomalies detected in the provided logs.</p></div>',
-                "",
-                "",
-                gr.update(value=get_incident_history())
-            )
-        
-        # ANOMALY
-        anomaly_html = f'''<div style="padding: 20px; background: linear-gradient(135deg, #ff6b6b 0%, #ee5a6f 100%); color: white; border-radius: 8px; box-shadow: 0 4px 15px rgba(255, 107, 107, 0.3);">
-<h3 style="margin-top: 0;">🔴 ANOMALY DETECTED</h3>
-<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-top: 15px;">
-    <div><strong>Type:</strong> <code>{anomaly.get('anomaly_type', 'N/A')}</code></div>
-    <div><strong>Severity:</strong> <span style="background: rgba(255,255,255,0.2); padding: 4px 8px; border-radius: 4px; font-weight: bold;">{anomaly.get('severity', 'N/A')}</span></div>
-    <div><strong>Component:</strong> <code>{anomaly.get('affected_component', 'N/A')}</code></div>
-    <div><strong>Description:</strong> {anomaly.get('description', 'N/A')}</div>
-</div>
-</div>'''
-        
-        # ROOT CAUSE
-        root_cause = result.get("root_cause", {})
-        root_cause_html = f'''<div style="padding: 20px; background: linear-gradient(135deg, #ffa502 0%, #ff8c00 100%); color: white; border-radius: 8px; box-shadow: 0 4px 15px rgba(255, 165, 0, 0.3);">
-<h3 style="margin-top: 0;">🔍 ROOT CAUSE ANALYSIS</h3>
-<div style="margin-top: 15px;">
-    <div style="margin-bottom: 12px;"><strong>🎯 Root Cause:</strong><br>{root_cause.get('root_cause', 'N/A')}</div>
-    <div style="margin-bottom: 12px;"><strong>📊 Confidence:</strong> <span style="background: rgba(255,255,255,0.2); padding: 4px 8px; border-radius: 4px;">{root_cause.get('confidence', 0):.1%}</span></div>
-    <div style="margin-bottom: 12px;"><strong>📝 Evidence:</strong><br><code style="background: rgba(0,0,0,0.1); padding: 8px; border-radius: 4px; display: block; margin-top: 5px;">{chr(10).join(root_cause.get('evidence', [])[:2])}</code></div>
-    <div><strong>⚠️ Contributing Factors:</strong><br>{', '.join(root_cause.get('contributing_factors', []))}</div>
-</div>
-</div>'''
-        
-        # REMEDIATION
-        remediation = result.get("remediation", {})
-        escalation_badge = '⚠️ YES' if remediation.get('escalation_needed') else '✅ NO'
-        remediation_html = f'''<div style="padding: 20px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border-radius: 8px; box-shadow: 0 4px 15px rgba(102, 126, 234, 0.3);">
-<h3 style="margin-top: 0;">⚙️ REMEDIATION PLAN</h3>
-<div style="margin-top: 15px;">
-    <div style="margin-bottom: 12px;"><strong>🚀 Immediate Actions:</strong><br>{', '.join(remediation.get('immediate_actions', [])[:2])}</div>
-    <div style="margin-bottom: 12px;"><strong>🔧 Automated Actions:</strong><br>{', '.join([a.get('action', '') for a in remediation.get('automated_actions', [])[:2]])}</div>
-    <div style="margin-bottom: 12px;"><strong>⏱️ Recovery Time:</strong> <span style="background: rgba(255,255,255,0.2); padding: 4px 8px; border-radius: 4px; font-weight: bold;">{remediation.get('estimated_recovery_time', 'N/A')}</span></div>
-    <div style="margin-bottom: 12px;"><strong>🚨 Escalation Needed:</strong> {escalation_badge}</div>
-    <div><strong>🛡️ Prevention Measures:</strong><br>{', '.join(remediation.get('prevention_measures', [])[:2])}</div>
-</div>
-</div>'''
-        
-        return anomaly_html, root_cause_html, remediation_html, gr.update(value=get_incident_history())
-        
+        if res.status_code == 200:
+            data = res.json()
+            if not data.get("anomaly_detected", True):
+                return "✅ No anomalies detected in the provided logs.", fetch_history(token)
+            
+            output = f"""
+### 🔴 ANOMALY DETECTED
+**Type:** {data.get('anomaly', {}).get('anomaly_type')} | **Severity:** {data.get('anomaly', {}).get('severity')}
+**Description:** {data.get('anomaly', {}).get('description')}
+
+---
+### 🔍 ROOT CAUSE ANALYSIS
+**Root Cause:** {data.get('root_cause', {}).get('root_cause')}
+**Confidence:** {data.get('root_cause', {}).get('confidence', 0):.1%}
+
+---
+### ⚙️ REMEDIATION PLAN
+**Immediate Actions:** {', '.join(data.get('remediation', {}).get('immediate_actions', []))}
+**Recovery Time:** {data.get('remediation', {}).get('estimated_recovery_time', 'N/A')}
+            """
+            return output, fetch_history(token)
+        return f"❌ Error: {res.text}", gr.update()
     except Exception as e:
-        print(f"ERROR: {e}")  # Debug
-        return f'<div style="color: red; padding: 20px; background: #f8d7da; border-radius: 4px;">❌ Error: {str(e)}</div>', "", "", gr.update(value=get_incident_history())
+        return f"❌ Connection Error: {str(e)}", gr.update()
 
-total, resolved, critical = get_stats()
+# --- UI Layout ---
 
-with gr.Blocks(title="AGENTS_026") as demo:
-    gr.Markdown("""
-    # 🔧 AGENTS_026: Autonomous Incident Diagnosis & Resolution
-    **Real-time AI-powered incident detection, root cause analysis, and remediation recommendations**
-    """)
+custom_css = """
+body { background-color: #0f172a !important; color: #e2e8f0 !important; }
+"""
+
+with gr.Blocks(title="AGENTS_026", css=custom_css, theme=gr.themes.Monochrome()) as demo:
     
-    with gr.Row():
-        with gr.Column(scale=1, min_width=150):
-            gr.Markdown(f"<div style='text-align: center; padding: 20px; background: rgba(255, 107, 107, 0.1); border-radius: 8px; border-left: 4px solid #ff6b6b;'><h2 style='margin: 0;'>{total}</h2><p style='margin: 0; opacity: 0.8;'>Total Incidents</p></div>")
-        with gr.Column(scale=1, min_width=150):
-            gr.Markdown(f"<div style='text-align: center; padding: 20px; background: rgba(40, 167, 69, 0.1); border-radius: 8px; border-left: 4px solid #28a745;'><h2 style='margin: 0;'>{resolved}</h2><p style='margin: 0; opacity: 0.8;'>Resolved</p></div>")
-        with gr.Column(scale=1, min_width=150):
-            gr.Markdown(f"<div style='text-align: center; padding: 20px; background: rgba(255, 193, 7, 0.1); border-radius: 8px; border-left: 4px solid #ffc107;'><h2 style='margin: 0;'>{critical}</h2><p style='margin: 0; opacity: 0.8;'>Critical</p></div>")
+    # State variable to hold the JWT token
+    session_token = gr.State("")
     
-    with gr.Row():
-        with gr.Column(scale=1):
-            gr.Markdown("### 📝 Submit System Logs")
-            logs_input = gr.Textbox(
-                label="System Logs",
-                placeholder="[ERROR] nginx worker crashed\n[WARNING] memory: 90%\n[ERROR] cpu: 95%\n[CRITICAL] service unavailable",
-                lines=12
-            )
-            diagnose_btn = gr.Button("🚀 Analyze Incident", size="lg", variant="primary", scale=1)
-        
-        with gr.Column(scale=1):
-            gr.Markdown("### 📋 Recent Incidents")
-            history_table = gr.Dataframe(
-                value=get_incident_history(),
-                interactive=False
-            )
+    gr.Markdown("# 🛡️ AGENTS_026: Intelligent Incident Diagnostics Platform")
+    auth_msg = gr.Markdown("")
+
+    # === AUTHENTICATION VIEW ===
+    with gr.Column(visible=True) as auth_view:
+        with gr.Tab("Login"):
+            log_email = gr.Textbox(label="Email", placeholder="test@example.com")
+            log_pass = gr.Textbox(label="Password", type="password")
+            login_btn = gr.Button("Login 🚀", variant="primary")
+            
+        with gr.Tab("Register"):
+            reg_name = gr.Textbox(label="Full Name", placeholder="John Doe")
+            reg_email = gr.Textbox(label="Email", placeholder="test2@example.com")
+            reg_pass = gr.Textbox(label="Password", type="password")
+            register_btn = gr.Button("Sign Up 📝")
+
+    # === MAIN APP VIEW (Hidden until logged in) ===
+    with gr.Column(visible=False) as app_view:
+        with gr.Tabs():
+            with gr.Tab("Live Diagnosis"):
+                with gr.Row():
+                    with gr.Column(scale=2):
+                        logs_input = gr.Textbox(
+                            label="Paste System Logs (One per line)", 
+                            lines=10, 
+                            placeholder="[ERROR] nginx worker crashed\n[WARNING] memory: 90%\n[ERROR] cpu: 95%"
+                        )
+                        diagnose_btn = gr.Button("Analyze Incident ⚡", variant="primary")
+                        
+                        gr.Examples(
+                            examples=[
+                                "[ERROR] nginx worker crashed\n[WARNING] memory: 90%\n[ERROR] cpu: 95%",
+                                "[INFO] database pool active\n[CRITICAL] connection timeout\n[CRITICAL] query failed"
+                            ],
+                            inputs=logs_input
+                        )
+                    
+                    with gr.Column(scale=3):
+                        results_output = gr.Markdown("Waiting for logs... ⏳")
+
+            with gr.Tab("My Incident History"):
+                refresh_btn = gr.Button("Refresh History 🔄", size="sm")
+                history_table = gr.Dataframe(interactive=False)
+                
+        logout_btn = gr.Button("Logout 🔒", size="sm")
+
+    # --- Event Wiring ---
     
-    with gr.Row():
-        with gr.Column():
-            anomaly_output = gr.HTML("<p style='color: #999;'>Results will appear here...</p>")
-        with gr.Column():
-            root_cause_output = gr.HTML("<p style='color: #999;'>Results will appear here...</p>")
-        with gr.Column():
-            remediation_output = gr.HTML("<p style='color: #999;'>Results will appear here...</p>")
-    
-    diagnose_btn.click(
-        diagnose_logs,
-        inputs=logs_input,
-        outputs=[anomaly_output, root_cause_output, remediation_output, history_table]
+    # Login Flow: Attempt Login -> Hide Auth View -> Show App View -> Fetch History
+    login_btn.click(
+        fn=api_login, inputs=[log_email, log_pass], outputs=[session_token, auth_view, app_view, auth_msg]
+    ).then(
+        fn=fetch_history, inputs=[session_token], outputs=[history_table]
     )
     
-    gr.Examples(
-        [
-            "[ERROR] nginx worker crashed\n[WARNING] memory: 90%\n[ERROR] cpu: 95%",
-            "[CRITICAL] database connection timeout\n[ERROR] query failed\n[WARNING] 10 failed queries",
-            "[CRITICAL] service unavailable\n[ERROR] api down\n[WARNING] high latency detected",
-            "[ERROR] disk usage: 98%\n[CRITICAL] no space left\n[WARNING] eviction in progress",
-        ],
-        inputs=logs_input,
-        label="📌 Example Incidents - Click to Load"
+    # Register Flow
+    register_btn.click(
+        fn=api_register, inputs=[reg_email, reg_pass, reg_name], outputs=[session_token, auth_view, app_view, auth_msg]
+    ).then(
+        fn=fetch_history, inputs=[session_token], outputs=[history_table]
+    )
+    
+    # Diagnosis Flow
+    diagnose_btn.click(
+        fn=diagnose_logs, inputs=[logs_input, session_token], outputs=[results_output, history_table]
+    )
+    
+    # Refresh History
+    refresh_btn.click(
+        fn=fetch_history, inputs=[session_token], outputs=[history_table]
+    )
+    
+    # Logout Flow
+    logout_btn.click(
+        fn=lambda: ("", gr.update(visible=True), gr.update(visible=False), "Logged out successfully."),
+        inputs=[], outputs=[session_token, auth_view, app_view, auth_msg]
     )
 
 if __name__ == "__main__":
