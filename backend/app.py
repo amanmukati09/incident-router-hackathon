@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, Header, HTTPException
+from fastapi import FastAPI, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
@@ -10,9 +10,9 @@ from agents.monitor import MonitorAgent
 from agents.diagnosis import DiagnosisAgent
 from agents.remediation import RemediationAgent
 
-app = FastAPI(title="AGENTS_026 - Production")
+app = FastAPI(title="AegisAI Backend")
 
-# CORS for frontend communication
+# CORS Middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,7 +21,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Include Authentication Routes
+# Auth Router
 app.include_router(auth_router)
 
 # Initialize Agents
@@ -32,14 +32,13 @@ remediation = RemediationAgent()
 class IncidentRequest(BaseModel):
     logs: list[str]
 
-
 @app.post("/diagnose")
 async def diagnose_incident(
     request: IncidentRequest, 
     current_user: User = Depends(get_current_user), 
     db: Session = Depends(get_db)
 ):
-    """Diagnose incident and save to user's history"""
+    """Full diagnosis pipeline (Protected)"""
     anomaly = monitor.detect_anomaly(request.logs)
     if not anomaly.get("anomaly_detected"):
         return {"status": "ok", "anomaly_detected": False}
@@ -47,15 +46,15 @@ async def diagnose_incident(
     root_cause = diagnosis.analyze_root_cause(anomaly, request.logs)
     remed_plan = remediation.suggest_remediation(anomaly, root_cause)
     
-    # SAVE THE RAW LOGS
+    # Save the input logs
     log_text = "\n".join(request.logs)
     
     new_incident = Incident(
         user_id=current_user.id,
         raw_logs=log_text,
         status="open",
-        anomaly_description=anomaly.get("description", "Unknown anomaly"),
-        root_cause=root_cause.get("root_cause", "Pending analysis"),
+        anomaly_description=f"Type: {anomaly.get('anomaly_type')} | Severity: {anomaly.get('severity')}",
+        root_cause=root_cause.get("root_cause"),
         remediation_action=", ".join(remed_plan.get("immediate_actions", [])),
         remediation_status="pending"
     )
@@ -75,10 +74,11 @@ async def get_user_incidents(
     current_user: User = Depends(get_current_user), 
     db: Session = Depends(get_db)
 ):
-    """Get all incidents for current user"""
-    incidents = db.query(Incident).filter(Incident.user_id == current_user.id).order_by(Incident.timestamp.desc()).all()
+    """Get all incidents specific to the logged-in user"""
+    incidents = db.query(Incident).filter(
+        Incident.user_id == current_user.id
+    ).order_by(Incident.timestamp.desc()).all()
     
-    # RETURN RAW LOGS TO FRONTEND
     return [{
         "id": i.id, 
         "timestamp": i.timestamp, 
@@ -93,7 +93,6 @@ async def get_user_incidents(
 def health():
     return {"status": "ok"}
 
-# THIS WAS THE BUG. It must have double underscores!
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
